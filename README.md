@@ -1,77 +1,79 @@
 # STU: Speculative Threading Unit
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/joaotemochko/Instruction-Flow-Expander)
-[![License](https://img.shields.io/badge/license-MIT-blue)](https://github.com/joaotemochko/Instruction-Flow-Expander)
-[![Language](https://img.shields.io/badge/language-SystemVerilog-purple)](https://github.com/joaotemochko/Instruction-Flow-Expander)
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](...)
+[![License](https://img.shields.io/badge/license-MIT-blue)](...)
+[![Language](https://img.shields.io/badge/language-SystemVerilog-purple)](...)
 
-The **STU (Speculative Threading Unit)** is a SystemVerilog hardware architecture designed to extract Thread-Level Parallelism (TLP) from *single-threaded* code via an adaptive speculation system.
+The **STU (Speculative Threading Unit)** is a SystemVerilog hardware architecture designed to extract Thread-Level Parallelism (TLP) from *single-threaded* code.
 
-## 🎯 The Problem
-
-Many applications (such as games, physics simulators, and media processing) spend most of their time in *loops* that are serialized at the software level, even though they contain vast data parallelism (ILP/TLP).
-
-## 💡 The Solution: The "Adaptive Flow Director"
-
-The STU is not a single architecture, but rather an **Adaptive Flow Director**. It analyzes the instruction stream and dynamically selects, at the hardware level, the best execution strategy to minimize losses and maximize gains.
-
-The STU operates on three levels of speculation:
-
-
-
-* **Level 0: Safety Bypass (Objective: "No-Loss")**
-    * **Detection:** Explicit synchronization code (`FENCE`, `AMO`) or system calls (`ECALL`).
-    * **Action:** Speculation is disabled. The code is serialized.
-    * **Result:** Guarantees correctness for *multi-threaded* software with no risk of failure.
-
-* **Level 1: Conservative Speculation (IFE-Mode) (Objective: "Safe Gains")**
-    * **Detection:** "Easy" code block (no `STORE`s or `BRANCH`es, only `LOAD`s and `COMPUTE`).
-    * **Action:** The STU reconfigures as an "Expander." The `stu_fork_controller` splits the work (the block) among idle cores. The `stu_memory_tracker` is disabled to save power.
-    * **Result:** A performance gain (e.g., 2x-4x) with **zero risk** of a `SQUASH`.
-
-* **Level 2: Optimistic Speculation (STU-Mode) (Objective: "The High Bet")**
-    * **Detection:** "Hard" code (contains `STORE`s, `BRANCH`es, or is a complex loop).
-    * **Action:** The full STU architecture is enabled. The `stu_fork_controller` "forks" the loop, and the `stu_memory_tracker` (with its CAMs) is activated to check for data violations.
-    * **Result:** A massive performance gain (`COMMIT`) or a controlled performance loss (`SQUASH`).
+Its primary goal is to **minimize performance loss** from failed speculation while still capturing both modest (safe) and aggressive (high-risk) performance gains. It achieves this by acting as an **Adaptive Flow Director** that dynamically selects one of three execution strategies for any given block of code.
 
 ---
 
-## 🏛️ Architecture & Modules
+## 🏛️ The 3-Level Adaptive Architecture
 
-The system is composed of a top module (`stu_top`) that coordinates four primary components.
+The STU is built on a 3-level execution hierarchy. The `stu_safety_filter` analyzes each instruction block and classifies it, allowing the `stu_fork_controller` to select the optimal strategy.
+
+### Level 0: Safety Bypass (Minimal Loss)
+This mode handles code that must be serialized to ensure correctness, such as explicit software-level multi-threading.
+
+* **Trigger:** The `stu_safety_filter` detects instructions with global side-effects (e.g., `FENCE`, `AMO`, `SYSTEM`).
+* **Action:** The `stu_fork_controller` idles and does nothing. The code is forwarded to the Master core (Core 0) for standard serial execution.
+* **Result:** **Minimal Performance Loss.** The only cost is the single-cycle lookup in the filter. This prevents speculation from breaking software-level synchronization.
+
+### Level 1: Conservative Parallelism (Modest, Safe Gain)
+This mode provides a "safe" performance boost for "embarrassingly parallel" code.
+
+* **Trigger:** The `stu_safety_filter` identifies a block containing *only* safe instructions (e.g., `LOAD`s, `ADD`s, `MUL`s) and no `STORE`s or `BRANCH`es.
+* **Action:** The `stu_fork_controller` enters "Block Expander" mode. It finds idle worker cores and dispatches the block, split among them (e.g., 2 instructions each). The expensive `stu_memory_tracker` remains clock-gated, saving power.
+* **Result:** **Modest Performance Gain.** This mode provides a risk-free performance boost with minimal power overhead, as a `SQUASH` is impossible.
+
+### Level 2: Optimistic Speculation (High-Gain, Controlled-Risk)
+This is the "high-stakes" mode for complex code (like loops containing `STORE`s) that cannot be handled by Level 1.
+
+* **Trigger:** The `stu_safety_filter` detects a "difficult" block (containing `STORE`s or `BRANCH`es).
+* **Action:** The `stu_fork_controller` attempts a "thread fork", but **only if the HPT predicts success**.
+* **Result (COMMIT):** **Massive Performance Gain.** A complex loop is successfully parallelized.
+* **Result (SQUASH):** **High Performance Loss.** The `stu_memory_tracker` detected a data violation or the `stu_validator` received an exception. The work is discarded.
+
+---
+
+## 🛡️ Minimizing the Achilles' Heel: The HPT
+
+The greatest risk of Level 2 is the `SQUASH`. The STU mitigates this "Achilles' heel" by using a **History Predictor Table (HPT)** inside the `stu_fork_controller`.
+
+1.  **Prediction:** Before attempting a Level 2 "fork", the controller consults the HPT to check the "confidence score" for that loop (based on its PC).
+2.  **Risk Aversion:** If the HPT predicts a failure (e.g., the loop failed last time), the `stu_fork_controller` **cancels the bet**. It overrides the Level 2 classification and treats the block as Level 0 (Bypass).
+3.  **Learning:** After a `SQUASH` or `COMMIT`, the `stu_validator` sends feedback to the `stu_fork_controller`, which updates the HPT entry for that loop.
+
+This HPT mechanism ensures that the STU "learns" to avoid loops that cause frequent failures, converting a **High Performance Loss** scenario into a **Minimal Loss** (Bypass) scenario.
+
+---
+
+## 🐧 OS & MMU Support
+
+The STU is designed to be compatible with OS-capable cores (like Nebula and Supernova) that use virtual memory (MMU).
+
+1.  **Physical Address (PA) Tracking:** The `stu_memory_tracker` is designed to snoop **Physical Addresses** (`core_mem_pa_in`) *after* the core's MMU/TLB. This correctly detects memory *aliasing*, where different Virtual Addresses point to the same Physical Address.
+2.  **Context Management:** The `stu_fork_controller` implements a "Context Copy" state. It uses a new module, `stu_context_manager`, to copy the full register file (`regfile`) from the Master core to the Speculative core before starting a Level 2 fork.
+3.  **Exception Handling:** The `stu_validator` accepts an `l2_spec_exception_in` signal. Any exception on a speculative core (e.g., a Page Fault) is immediately treated as a `SQUASH`.
+
+---
+
+## 📦 Architecture Modules
 
 | Module | Function |
 | :--- | :--- |
-| **`stu_top.sv`** | The top-level module that instantiates and connects all STU components. |
-| **`stu_safety_filter.sv`** | **The Flow Director.** Combinational decoder that analyzes the instruction stream and classifies each block into Level 0, 1, or 2. |
-| **`stu_fork_controller.sv`** | **The Brain.** FSM that forks tasks. Detects triggers (*loops*) and allocates idle cores, operating in either "Expander" (Level 1) or "Forker" (Level 2) mode. |
-| **`stu_memory_tracker.sv`** | **The Spy (Level 2).** The most complex component. Uses CAMs (Content Addressable Memories) to track the "Read-Sets" of speculative cores and compare them against the Master core's `STORE`s. |
-| **`stu_validator.sv`** | **The Judge (Level 2).** FSM that coordinates "done" and "violation" signals. Issues the final `SQUASH` (failure) or `COMMIT` (success) pulse for the task. |
-| **`stu_pkg.sv`** | SystemVerilog package containing global types and parameters. |
+| **`stu_pkg.sv`** | Defines global types (`addr_t`, `instr_t`) and the `spec_level_t` enum. |
+| **`stu_safety_filter.sv`** | **The Director.** Combinational logic that classifies an instruction block as L0, L1, or L2. |
+| **`stu_fork_controller.sv`** | **The Brain.** The main FSM. Manages L1 dispatches, L2 forks, and the HPT to decide when to "bet". |
+| **`stu_memory_tracker.sv`** | **The Spy.** Power-gated module (L2 only). Uses CAMs to track Read-Sets (PAs) and detect data violations (RAW hazards). |
+| **`stu_validator.sv`** | **The Judge.** Power-gated FSM (L2 only). Manages the `COMMIT`/`SQUASH` lifecycle and handles exceptions. |
+| **`stu_context_manager.sv`** | **The Copier.** FSM that manages the high-latency register file copy from Master to Speculative core before an L2 fork. |
+| **`stu_top.sv`** | **The Top-Level.** Instantiates all components and connects them to the SoC and core interfaces. |
 
 ---
-
-## ⚙️ Example Workflow
-
-1.  **Level 1 (Safe Gain):**
-    * A block of 4 `fld` (float loads) arrives.
-    * The `stu_safety_filter` classifies it as **Level 1** (no `STORE`s).
-    * The `stu_fork_controller` is instructed to split the block among 4 idle cores.
-    * **Result:** Data fetch time is divided by 4. The `stu_memory_tracker` remains off, saving power.
-
-2.  **Level 2 (The High Bet):**
-    * The `stu_safety_filter` detects a backward branch (`BNE`) containing `STORE`s. It classifies it as **Level 2**.
-    * The `stu_fork_controller` "forks" the next loop iteration to Core 1.
-    * The `stu_memory_tracker` is activated and begins logging Core 1's `LOAD`s into its Read-Set.
-    * **If Core 0 (Master) performs a `STORE`** to an address Core 1 has already read, the tracker fires `violation_out`. The `stu_validator` issues a `SQUASH`.
-    * **If Core 0 (Master) finishes** with no violations, the `stu_validator` waits for Core 1 to finish and issues a `COMMIT`.
-
----
-
-## ⚖️ Trade-offs: Power vs. Performance
-
-* **Performance:** The net gain depends on the "hit rate" of Level 2 bets. In ideal workloads (games, physics), the Level 1 code and Level 2 `COMMIT`s will far outweigh the losses from `SQUASH`es.
-* **Power:** Power consumption is the greatest challenge. The `stu_memory_tracker` is expensive, as CAMs are power-hungry components. The STU's adaptive architecture mitigates this by activating the tracker ("The Spy") only when absolutely necessary (Level 2), while operating in a low-power mode (Level 1) the rest of the time.
 
 ## 🚧 Project Status
 
-**Work in Progress (WIP)** - This architecture is a conceptual prototype for exploring Adaptive Thread-Level Speculation.
+**Work in Progress (WIP)** - The core logic for the 3-Level Adaptive STU is defined. The next step is the implementation of the `Nebula` (In-Order) and `Supernova` (OoO) cores, which must adhere to the STU interfaces (PA snoop, context copy, exception reporting, etc.).
